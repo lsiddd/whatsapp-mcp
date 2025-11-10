@@ -1,26 +1,28 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"math/rand"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/mdp/qrterminal"
-
-	"bytes"
 
 	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
@@ -641,7 +643,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Download the media using whatsmeow client
-	mediaData, err := client.Download(downloader)
+	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -676,9 +678,11 @@ func extractDirectPathFromURL(url string) string {
 }
 
 // Start a REST API server to expose the WhatsApp client functionality
-func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
+func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) (int, error) {
+	mux := http.NewServeMux()
+
 	// Handler for sending messages
-	http.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -724,7 +728,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	})
 
 	// Handler for downloading media
-	http.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -774,16 +778,147 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
-	// Start the server
-	serverAddr := fmt.Sprintf(":%d", port)
-	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
+	address := fmt.Sprintf(":%d", port)
+	listener, err := net.Listen("tcp", address)
+	selectedPort := port
+	if err != nil {
+		fmt.Printf("REST API server error: unable to bind to %s: %v\n", address, err)
+		fmt.Println("Attempting to bind to an ephemeral port...")
+		listener, err = net.Listen("tcp", ":0")
+		if err != nil {
+			return 0, fmt.Errorf("failed to bind fallback port: %w", err)
+		}
+		if tcpAddr, ok := listener.Addr().(*net.TCPAddr); ok {
+			selectedPort = tcpAddr.Port
+		}
+	}
 
-	// Run server in a goroutine so it doesn't block
+	fmt.Printf("Starting REST API server on :%d...\n", selectedPort)
 	go func() {
-		if err := http.ListenAndServe(serverAddr, nil); err != nil {
+		if err := http.Serve(listener, mux); err != nil {
 			fmt.Printf("REST API server error: %v\n", err)
 		}
 	}()
+
+	return selectedPort, nil
+}
+
+var (
+	errQRTimeout       = errors.New("QR pairing timed out")
+	errQRChannelClosed = errors.New("QR channel closed before authentication completed")
+)
+
+// waitForQRCodeAuth blocks until a pairing result is received from the QR channel.
+func waitForQRCodeAuth(qrChan <-chan whatsmeow.QRChannelItem, logger waLog.Logger) error {
+	for evt := range qrChan {
+		switch evt.Event {
+		case whatsmeow.QRChannelEventCode:
+			fmt.Println("\nScan this QR code with your WhatsApp app:")
+			qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
+			if evt.Timeout > 0 {
+				fmt.Printf("QR code expires in %s\n", evt.Timeout.Round(time.Second))
+			}
+		case whatsmeow.QRChannelEventError:
+			if evt.Error != nil {
+				return fmt.Errorf("error while pairing device: %w", evt.Error)
+			}
+			return fmt.Errorf("error while pairing device")
+		case whatsmeow.QRChannelTimeout.Event, "timeout":
+			return errQRTimeout
+		case "success":
+			return nil
+		case "err-unexpected-state":
+			return fmt.Errorf("unexpected state while pairing. Please restart the client.")
+		case "err-client-outdated":
+			return fmt.Errorf("client is outdated. Update to the latest whatsmeow build")
+		case "err-scanned-without-multidevice":
+			return fmt.Errorf("device is not enrolled in WhatsApp multi-device beta")
+		default:
+			logger.Warnf("Received unexpected QR channel event: %s", evt.Event)
+		}
+	}
+
+	return errQRChannelClosed
+}
+
+// connectWhatsAppClient tries to bring the WhatsApp client online and blocks until the connection stabilizes.
+// It returns an error instead of exiting so the caller can decide whether to run in an offline mode.
+func connectWhatsAppClient(client *whatsmeow.Client, logger waLog.Logger) error {
+	if client == nil {
+		return fmt.Errorf("client is not initialized")
+	}
+
+	if client.Store.ID == nil {
+		// No stored session, we need to pair the device. Keep trying until the user scans
+		for attempt := 1; ; attempt++ {
+			qrChan, err := client.GetQRChannel(context.Background())
+			if err != nil {
+				return fmt.Errorf("failed to get QR channel: %w", err)
+			}
+
+			if err := client.Connect(); err != nil {
+				return fmt.Errorf("failed to connect: %w", err)
+			}
+
+			err = waitForQRCodeAuth(qrChan, logger)
+			if err == nil {
+				break
+			}
+
+			client.Disconnect()
+			if errors.Is(err, errQRTimeout) || errors.Is(err, errQRChannelClosed) {
+				logger.Warnf("Pairing attempt %d did not complete (%v). Retrying...", attempt, err)
+				time.Sleep(5 * time.Second)
+				continue
+			}
+
+			return err
+		}
+	} else {
+		if err := client.Connect(); err != nil {
+			return fmt.Errorf("failed to connect: %w", err)
+		}
+	}
+
+	// Wait a moment for connection to stabilize
+	time.Sleep(2 * time.Second)
+
+	if !client.IsConnected() {
+		return fmt.Errorf("failed to establish stable connection")
+	}
+
+	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
+	return nil
+}
+
+// getRESTPort determines which port the REST server should listen on.
+// It checks REST_PORT, then PORT environment variables, falling back to 8080.
+func getRESTPort() int {
+	defaultPort := 8080
+
+	readPortEnv := func(key string) (int, bool) {
+		val := strings.TrimSpace(os.Getenv(key))
+		if val == "" {
+			return 0, false
+		}
+
+		parsed, err := strconv.Atoi(val)
+		if err != nil || parsed <= 0 || parsed > 65535 {
+			fmt.Printf("Invalid %s value %q, ignoring.\n", key, val)
+			return 0, false
+		}
+		return parsed, true
+	}
+
+	if port, ok := readPortEnv("REST_PORT"); ok {
+		return port
+	}
+
+	if port, ok := readPortEnv("PORT"); ok {
+		return port
+	}
+
+	return defaultPort
 }
 
 func main() {
@@ -800,14 +935,14 @@ func main() {
 		return
 	}
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
 	}
 
 	// Get device store - This contains session information
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// No device exists, create one
@@ -853,73 +988,41 @@ func main() {
 		}
 	})
 
-	// Create channel to track connection success
-	connected := make(chan bool, 1)
-
-	// Connect to WhatsApp
-	if client.Store.ID == nil {
-		// No ID stored, this is a new client, need to pair with phone
-		qrChan, _ := client.GetQRChannel(context.Background())
-		err = client.Connect()
-		if err != nil {
-			logger.Errorf("Failed to connect: %v", err)
-			return
-		}
-
-		// Print QR code for pairing with phone
-		for evt := range qrChan {
-			if evt.Event == "code" {
-				fmt.Println("\nScan this QR code with your WhatsApp app:")
-				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
-			} else if evt.Event == "success" {
-				connected <- true
-				break
-			}
-		}
-
-		// Wait for connection
-		select {
-		case <-connected:
-			fmt.Println("\nSuccessfully connected and authenticated!")
-		case <-time.After(3 * time.Minute):
-			logger.Errorf("Timeout waiting for QR code scan")
-			return
-		}
-	} else {
-		// Already logged in, just connect
-		err = client.Connect()
-		if err != nil {
-			logger.Errorf("Failed to connect: %v", err)
-			return
-		}
-		connected <- true
+	offlineMode := false
+	if os.Getenv("WHATSAPP_OFFLINE") == "1" {
+		offlineMode = true
+		logger.Warnf("WHATSAPP_OFFLINE=1 detected, skipping WhatsApp connection attempt.")
+	} else if err := connectWhatsAppClient(client, logger); err != nil {
+		offlineMode = true
+		logger.Warnf("Failed to connect to WhatsApp (%v). Continuing in offline mode.", err)
 	}
 
-	// Wait a moment for connection to stabilize
-	time.Sleep(2 * time.Second)
-
-	if !client.IsConnected() {
-		logger.Errorf("Failed to establish stable connection")
-		return
+	if offlineMode {
+		fmt.Println("WhatsApp connectivity is unavailable. REST endpoints will report 'Not connected' until a connection is established.")
 	}
 
-	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
-
-	// Start REST API server
-	startRESTServer(client, messageStore, 8080)
+	restPort := getRESTPort()
+	actualPort, serverErr := startRESTServer(client, messageStore, restPort)
 
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)
 	signal.Notify(exitChan, syscall.SIGINT, syscall.SIGTERM)
 
-	fmt.Println("REST server is running. Press Ctrl+C to disconnect and exit.")
+	if serverErr != nil {
+		logger.Errorf("REST server failed to start: %v", serverErr)
+		fmt.Println("Continuing without REST server. Press Ctrl+C to exit.")
+	} else {
+		fmt.Printf("REST server is running on port %d. Press Ctrl+C to disconnect and exit.\n", actualPort)
+	}
 
 	// Wait for termination signal
 	<-exitChan
 
 	fmt.Println("Disconnecting...")
 	// Disconnect client
-	client.Disconnect()
+	if client.IsConnected() {
+		client.Disconnect()
+	}
 }
 
 // GetChatName determines the appropriate name for a chat based on JID and other info
@@ -973,7 +1076,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 		// If we didn't get a name, try group info
 		if name == "" {
-			groupInfo, err := client.GetGroupInfo(jid)
+			groupInfo, err := client.GetGroupInfo(context.Background(), jid)
 			if err == nil && groupInfo.Name != "" {
 				name = groupInfo.Name
 			} else {
@@ -988,7 +1091,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		logger.Infof("Getting name for contact: %s", chatJID)
 
 		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(jid)
+		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
 		if err == nil && contact.FullName != "" {
 			name = contact.FullName
 		} else if sender != "" {
