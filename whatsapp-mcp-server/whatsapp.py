@@ -206,7 +206,8 @@ def list_messages(
             # Add context for each message
             messages_with_context = []
             for msg in result:
-                context = get_message_context(msg.id, context_before, context_after)
+                # REUSE the existing connection and pass the already fetched message object
+                context = get_message_context(msg.id, context_before, context_after, conn=conn, target_message=msg)
                 messages_with_context.extend(context.before)
                 messages_with_context.append(context.message)
                 messages_with_context.extend(context.after)
@@ -227,35 +228,42 @@ def list_messages(
 def get_message_context(
     message_id: str,
     before: int = 5,
-    after: int = 5
+    after: int = 5,
+    conn: Optional[sqlite3.Connection] = None,
+    target_message: Optional[Message] = None
 ) -> MessageContext:
     """Get context around a specific message."""
+    should_close_conn = False
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        if conn is None:
+            conn = sqlite3.connect(MESSAGES_DB_PATH)
+            should_close_conn = True
+            
         cursor = conn.cursor()
         
-        # Get the target message first
-        cursor.execute("""
-            SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.chat_jid, messages.media_type
-            FROM messages
-            JOIN chats ON messages.chat_jid = chats.jid
-            WHERE messages.id = ?
-        """, (message_id,))
-        msg_data = cursor.fetchone()
-        
-        if not msg_data:
-            raise ValueError(f"Message with ID {message_id} not found")
+        # Get the target message first if not provided
+        if target_message is None:
+            cursor.execute("""
+                SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.chat_jid, messages.media_type
+                FROM messages
+                JOIN chats ON messages.chat_jid = chats.jid
+                WHERE messages.id = ?
+            """, (message_id,))
+            msg_data = cursor.fetchone()
             
-        target_message = Message(
-            timestamp=datetime.fromisoformat(msg_data[0]),
-            sender=msg_data[1],
-            chat_name=msg_data[2],
-            content=msg_data[3],
-            is_from_me=msg_data[4],
-            chat_jid=msg_data[5],
-            id=msg_data[6],
-            media_type=msg_data[8]
-        )
+            if not msg_data:
+                raise ValueError(f"Message with ID {message_id} not found")
+                
+            target_message = Message(
+                timestamp=datetime.fromisoformat(msg_data[0]),
+                sender=msg_data[1],
+                chat_name=msg_data[2],
+                content=msg_data[3],
+                is_from_me=msg_data[4],
+                chat_jid=msg_data[5],
+                id=msg_data[6],
+                media_type=msg_data[8]
+            )
         
         # Get messages before
         cursor.execute("""
@@ -265,7 +273,7 @@ def get_message_context(
             WHERE messages.chat_jid = ? AND messages.timestamp < ?
             ORDER BY messages.timestamp DESC
             LIMIT ?
-        """, (msg_data[7], msg_data[0], before))
+        """, (target_message.chat_jid, target_message.timestamp, before))
         
         before_messages = []
         for msg in cursor.fetchall():
@@ -288,7 +296,7 @@ def get_message_context(
             WHERE messages.chat_jid = ? AND messages.timestamp > ?
             ORDER BY messages.timestamp ASC
             LIMIT ?
-        """, (msg_data[7], msg_data[0], after))
+        """, (target_message.chat_jid, target_message.timestamp, after))
         
         after_messages = []
         for msg in cursor.fetchall():
@@ -313,7 +321,7 @@ def get_message_context(
         print(f"Database error: {e}")
         raise
     finally:
-        if 'conn' in locals():
+        if should_close_conn and 'conn' in locals() and conn:
             conn.close()
 
 
