@@ -677,6 +677,23 @@ func extractDirectPathFromURL(url string) string {
 	return "/" + pathPart
 }
 
+// Auth middleware to secure the API
+func authMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		apiKey := os.Getenv("WHATSAPP_API_KEY")
+		if apiKey == "" {
+			apiKey = "whatsapp-mcp-secret-key" // Default key if not set
+		}
+
+		if r.Header.Get("X-API-Key") != apiKey {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
 // Start a REST API server to expose the WhatsApp client functionality
 func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) (int, error) {
 	mux := http.NewServeMux()
@@ -795,7 +812,9 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 
 	fmt.Printf("Starting REST API server on :%d...\n", selectedPort)
 	go func() {
-		if err := http.Serve(listener, mux); err != nil {
+		// Wrap mux with auth middleware
+		handler := authMiddleware(mux)
+		if err := http.Serve(listener, handler); err != nil {
 			fmt.Printf("REST API server error: %v\n", err)
 		}
 	}()
