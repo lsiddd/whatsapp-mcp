@@ -416,22 +416,43 @@ def search_contacts(query: str) -> List[Contact]:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
         
-        # Split query into characters to support partial matching
-        search_pattern = '%' +query + '%'
-        
-        cursor.execute("""
-            SELECT DISTINCT 
-                jid,
-                name
-            FROM chats
-            WHERE 
-                (LOWER(name) LIKE LOWER(?) OR LOWER(jid) LIKE LOWER(?))
-                AND jid NOT LIKE '%@g.us'
-            ORDER BY name, jid
-            LIMIT 50
-        """, (search_pattern, search_pattern))
-        
-        contacts = cursor.fetchall()
+        # Try FTS search first
+        fts_query = f"{query}*" if query else ""
+        contacts = []
+        try:
+            cursor.execute("""
+                SELECT jid, name
+                FROM chats_fts
+                WHERE chats_fts MATCH ?
+                ORDER BY rank
+                LIMIT 50
+            """, (fts_query,))
+            contacts = cursor.fetchall()
+            if not contacts and query:
+                 # If FTS returns nothing, it might be due to no matches OR table issue.
+                 # But if table exists, it returns list (empty or not).
+                 pass
+        except Exception:
+             # Fallback to LIKE if FTS table doesn't exist or other error
+            pass
+
+        if not contacts:
+            # Fallback to standard search if no results or FTS failed
+            search_pattern = '%' +query + '%'
+            
+            cursor.execute("""
+                SELECT DISTINCT 
+                    jid,
+                    name
+                FROM chats
+                WHERE 
+                    (LOWER(name) LIKE LOWER(?) OR LOWER(jid) LIKE LOWER(?))
+                    AND jid NOT LIKE '%@g.us'
+                ORDER BY name, jid
+                LIMIT 50
+            """, (search_pattern, search_pattern))
+
+            contacts = cursor.fetchall()
         
         result = []
         for contact_data in contacts:

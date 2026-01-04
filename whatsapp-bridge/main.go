@@ -93,6 +93,36 @@ func NewMessageStore(storeDir string) (*MessageStore, error) {
 		return nil, fmt.Errorf("failed to create tables: %v", err)
 	}
 
+	// Create FTS table for contacts
+	if _, ftsErr := db.Exec(`
+		CREATE VIRTUAL TABLE IF NOT EXISTS chats_fts USING fts5(jid, name);
+
+		-- Triggers to keep FTS in sync
+		CREATE TRIGGER IF NOT EXISTS chats_ai AFTER INSERT ON chats BEGIN
+			INSERT INTO chats_fts(jid, name) VALUES (new.jid, new.name);
+		END;
+
+		CREATE TRIGGER IF NOT EXISTS chats_ad AFTER DELETE ON chats BEGIN
+			DELETE FROM chats_fts WHERE jid = old.jid;
+		END;
+
+		CREATE TRIGGER IF NOT EXISTS chats_au AFTER UPDATE ON chats BEGIN
+			DELETE FROM chats_fts WHERE jid = old.jid;
+			INSERT INTO chats_fts(jid, name) VALUES (new.jid, new.name);
+		END;
+	`); ftsErr != nil {
+		fmt.Printf("Warning: Failed to create FTS table (fts5 might be missing): %v\n", ftsErr)
+		// Don't fail the whole startup, just warn. FTS is optional optimization.
+	} else {
+		// Backfill FTS table from existing chats if FTS creation succeeded
+		// Check if FTS acts as expected first (simple count) or just INSERT items missing
+		_, _ = db.Exec(`
+            INSERT INTO chats_fts(jid, name) 
+            SELECT jid, name FROM chats 
+            WHERE jid NOT IN (SELECT jid FROM chats_fts)
+        `)
+	}
+
 	return &MessageStore{db: db}, nil
 }
 
