@@ -49,14 +49,15 @@ type MessageStore struct {
 }
 
 // Initialize message store
-func NewMessageStore() (*MessageStore, error) {
+func NewMessageStore(storeDir string) (*MessageStore, error) {
 	// Create directory for database if it doesn't exist
-	if err := os.MkdirAll("store", 0755); err != nil {
+	if err := os.MkdirAll(storeDir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create store directory: %v", err)
 	}
 
 	// Open SQLite database for messages
-	db, err := sql.Open("sqlite3", "file:store/messages.db?_foreign_keys=on")
+	dbPath := filepath.Join(storeDir, "messages.db")
+	db, err := sql.Open("sqlite3", fmt.Sprintf("file:%s?_foreign_keys=on", dbPath))
 	if err != nil {
 		return nil, fmt.Errorf("failed to open message database: %v", err)
 	}
@@ -556,7 +557,7 @@ func (d *MediaDownloader) GetMediaType() whatsmeow.MediaType {
 }
 
 // Function to download media from a message
-func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, messageID, chatJID string) (bool, string, string, string, error) {
+func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, messageID, chatJID, storeDir string) (bool, string, string, string, error) {
 	// Query the database for the message
 	var mediaType, filename, url string
 	var mediaKey, fileSHA256, fileEncSHA256 []byte
@@ -564,7 +565,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	var err error
 
 	// First, check if we already have this file
-	chatDir := fmt.Sprintf("store/%s", strings.ReplaceAll(chatJID, ":", "_"))
+	chatDir := filepath.Join(storeDir, strings.ReplaceAll(chatJID, ":", "_"))
 	localPath := ""
 
 	// Get media info from the database
@@ -695,7 +696,7 @@ func authMiddleware(next http.Handler) http.Handler {
 }
 
 // Start a REST API server to expose the WhatsApp client functionality
-func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) (int, error) {
+func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int, storeDir string) (int, error) {
 	mux := http.NewServeMux()
 
 	// Handler for sending messages
@@ -766,7 +767,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		}
 
 		// Download the media
-		success, mediaType, filename, path, err := downloadMedia(client, messageStore, req.MessageID, req.ChatJID)
+		success, mediaType, filename, path, err := downloadMedia(client, messageStore, req.MessageID, req.ChatJID, storeDir)
 
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
@@ -940,6 +941,14 @@ func getRESTPort() int {
 	return defaultPort
 }
 
+func getStoreDir() string {
+	storeDir := os.Getenv("WHATSAPP_STORE_DIR")
+	if storeDir == "" {
+		storeDir = "store"
+	}
+	return storeDir
+}
+
 func main() {
 	// Set up logger
 	logger := waLog.Stdout("Client", "INFO", true)
@@ -948,13 +957,15 @@ func main() {
 	// Create database connection for storing session data
 	dbLog := waLog.Stdout("Database", "INFO", true)
 
+	storeDir := getStoreDir()
 	// Create directory for database if it doesn't exist
-	if err := os.MkdirAll("store", 0755); err != nil {
+	if err := os.MkdirAll(storeDir, 0755); err != nil {
 		logger.Errorf("Failed to create store directory: %v", err)
 		return
 	}
 
-	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	dbPath := filepath.Join(storeDir, "whatsapp.db")
+	container, err := sqlstore.New(context.Background(), "sqlite3", fmt.Sprintf("file:%s?_foreign_keys=on", dbPath), dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
@@ -981,7 +992,7 @@ func main() {
 	}
 
 	// Initialize message store
-	messageStore, err := NewMessageStore()
+	messageStore, err := NewMessageStore(storeDir)
 	if err != nil {
 		logger.Errorf("Failed to initialize message store: %v", err)
 		return
@@ -1021,7 +1032,7 @@ func main() {
 	}
 
 	restPort := getRESTPort()
-	actualPort, serverErr := startRESTServer(client, messageStore, restPort)
+	actualPort, serverErr := startRESTServer(client, messageStore, restPort, storeDir)
 
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)

@@ -7,8 +7,10 @@ import requests
 import json
 import audio
 
-MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
-WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
+default_db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
+MESSAGES_DB_PATH = os.environ.get("WHATSAPP_DB_PATH", default_db_path)
+
+WHATSAPP_API_BASE_URL = os.environ.get("WHATSAPP_API_URL", "http://localhost:8080/api")
 API_KEY = os.environ.get("WHATSAPP_API_KEY", "whatsapp-mcp-secret-key")
 
 @dataclass
