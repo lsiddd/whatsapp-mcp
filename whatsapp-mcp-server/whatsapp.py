@@ -810,3 +810,75 @@ def download_media(message_id: str, chat_jid: str) -> Optional[str]:
     except Exception as e:
         logger.error(f"Unexpected error: {str(e)}")
         return None
+
+
+def sync_contacts() -> dict:
+    """Sync contact names from WhatsApp to update phone-number-only names.
+
+    This function calls the WhatsApp bridge API to refresh contact names for
+    contacts that are currently stored with only phone numbers as names.
+    It uses the fallback chain: FullName → PushName → BusinessName → FirstName.
+
+    Returns:
+        A dictionary with sync results including:
+        - success: Whether the sync was successful
+        - message: A summary message
+        - total_checked: Number of contacts checked
+        - updated: Number of contacts updated
+        - failed: Number of contacts that failed to update
+        - details: List of updated contacts with old/new names
+    """
+    try:
+        url = f"{WHATSAPP_API_BASE_URL}/sync-contacts"
+        headers = {"X-API-Key": API_KEY}
+        response = requests.post(url, headers=headers)
+
+        if response.status_code == 200:
+            result = response.json()
+            logger.info(f"Contact sync completed: {result.get('message', '')}")
+            return result
+        else:
+            error_msg = f"Error: HTTP {response.status_code} - {response.text}"
+            logger.error(error_msg)
+            return {
+                "success": False,
+                "message": error_msg,
+                "total_checked": 0,
+                "updated": 0,
+                "failed": 0,
+                "details": []
+            }
+
+    except requests.RequestException as e:
+        error_msg = f"Request error: {str(e)}"
+        logger.error(error_msg)
+        return {
+            "success": False,
+            "message": error_msg,
+            "total_checked": 0,
+            "updated": 0,
+            "failed": 0,
+            "details": []
+        }
+    except json.JSONDecodeError:
+        error_msg = f"Error parsing response: {response.text}"
+        logger.error(error_msg)
+        return {
+            "success": False,
+            "message": error_msg,
+            "total_checked": 0,
+            "updated": 0,
+            "failed": 0,
+            "details": []
+        }
+    except Exception as e:
+        error_msg = f"Unexpected error: {str(e)}"
+        logger.error(error_msg)
+        return {
+            "success": False,
+            "message": error_msg,
+            "total_checked": 0,
+            "updated": 0,
+            "failed": 0,
+            "details": []
+        }

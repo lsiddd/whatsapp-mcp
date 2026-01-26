@@ -140,6 +140,48 @@ func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time
 	return err
 }
 
+// UpdateChatName updates only the name of an existing chat
+func (store *MessageStore) UpdateChatName(jid, name string) error {
+	_, err := store.db.Exec(
+		"UPDATE chats SET name = ? WHERE jid = ?",
+		name, jid,
+	)
+	return err
+}
+
+// GetChatsWithPhoneNumberNames returns all chats where the name appears to be a phone number
+func (store *MessageStore) GetChatsWithPhoneNumberNames() ([]struct {
+	JID  string
+	Name string
+}, error) {
+	rows, err := store.db.Query(`
+		SELECT jid, name FROM chats
+		WHERE jid LIKE '%@s.whatsapp.net'
+		AND name GLOB '[0-9]*'
+		AND name NOT GLOB '*[^0-9]*'
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var results []struct {
+		JID  string
+		Name string
+	}
+	for rows.Next() {
+		var item struct {
+			JID  string
+			Name string
+		}
+		if err := rows.Scan(&item.JID, &item.Name); err != nil {
+			return nil, err
+		}
+		results = append(results, item)
+	}
+	return results, rows.Err()
+}
+
 // Store a message in the database
 func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, timestamp time.Time, isFromMe bool,
 	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
@@ -826,6 +868,77 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
+	// Handler for syncing contact names
+	mux.HandleFunc("/api/sync-contacts", func(w http.ResponseWriter, r *http.Request) {
+		// Only allow POST requests
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+
+		// Get all chats with phone number names
+		chatsWithPhoneNames, err := messageStore.GetChatsWithPhoneNumberNames()
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": fmt.Sprintf("Failed to get chats: %v", err),
+			})
+			return
+		}
+
+		updated := 0
+		failed := 0
+		details := []map[string]string{}
+
+		for _, chat := range chatsWithPhoneNames {
+			// Parse JID
+			jid, err := types.ParseJID(chat.JID)
+			if err != nil {
+				failed++
+				continue
+			}
+
+			// Get contact info from WhatsApp
+			contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
+			if err != nil {
+				failed++
+				continue
+			}
+
+			// Get the best available name
+			newName := getContactName(contact)
+			if newName == "" || isPhoneNumber(newName) {
+				// No better name available
+				continue
+			}
+
+			// Update the name in the database
+			if err := messageStore.UpdateChatName(chat.JID, newName); err != nil {
+				failed++
+				continue
+			}
+
+			updated++
+			details = append(details, map[string]string{
+				"jid":      chat.JID,
+				"old_name": chat.Name,
+				"new_name": newName,
+			})
+		}
+
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":       true,
+			"message":       fmt.Sprintf("Synced contact names: %d updated, %d failed", updated, failed),
+			"total_checked": len(chatsWithPhoneNames),
+			"updated":       updated,
+			"failed":        failed,
+			"details":       details,
+		})
+	})
+
 	address := fmt.Sprintf(":%d", port)
 	listener, err := net.Listen("tcp", address)
 	selectedPort := port
@@ -1085,18 +1198,51 @@ func main() {
 	}
 }
 
+// isPhoneNumber checks if a string looks like a phone number (only digits)
+func isPhoneNumber(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// getContactName extracts the best available name from contact info using fallback chain
+// Priority: FullName → PushName → BusinessName → FirstName
+func getContactName(contact types.ContactInfo) string {
+	if contact.FullName != "" {
+		return contact.FullName
+	}
+	if contact.PushName != "" {
+		return contact.PushName
+	}
+	if contact.BusinessName != "" {
+		return contact.BusinessName
+	}
+	if contact.FirstName != "" {
+		return contact.FirstName
+	}
+	return ""
+}
+
 // GetChatName determines the appropriate name for a chat based on JID and other info
 func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types.JID, chatJID string, conversation interface{}, sender string, logger waLog.Logger) string {
 	// First, check if chat already exists in database with a name
 	var existingName string
 	err := messageStore.db.QueryRow("SELECT name FROM chats WHERE jid = ?", chatJID).Scan(&existingName)
-	if err == nil && existingName != "" {
-		// Chat exists with a name, use that
+	existingNameIsPhone := isPhoneNumber(existingName)
+
+	// If we have a real name (not just a phone number), use it
+	if err == nil && existingName != "" && !existingNameIsPhone {
 		logger.Infof("Using existing chat name for %s: %s", chatJID, existingName)
 		return existingName
 	}
 
-	// Need to determine chat name
+	// Need to determine chat name (either no existing name, or existing name is just a phone number)
 	var name string
 
 	if jid.Server == "g.us" {
@@ -1150,19 +1296,29 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		// This is an individual contact
 		logger.Infof("Getting name for contact: %s", chatJID)
 
-		// Just use contact info (full name)
+		// Get contact info and use fallback chain: FullName → PushName → BusinessName → FirstName
 		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
-		if err == nil && contact.FullName != "" {
-			name = contact.FullName
-		} else if sender != "" {
-			// Fallback to sender
+		if err == nil {
+			name = getContactName(contact)
+		}
+
+		// If no name from contact info, try sender
+		if name == "" && sender != "" && !isPhoneNumber(sender) {
 			name = sender
-		} else {
-			// Last fallback to JID
+		}
+
+		// Last fallback to JID (phone number)
+		if name == "" {
 			name = jid.User
 		}
 
 		logger.Infof("Using contact name: %s", name)
+	}
+
+	// If we found a better name than what was stored (phone number → real name), update the database
+	if existingNameIsPhone && !isPhoneNumber(name) && name != existingName {
+		logger.Infof("Updating contact name from %s to %s", existingName, name)
+		// We'll update the name when StoreChat is called by the caller
 	}
 
 	return name
